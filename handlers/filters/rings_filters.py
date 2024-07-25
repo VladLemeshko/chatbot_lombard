@@ -1,0 +1,331 @@
+from aiogram import types
+from aiogram.types import Message, InputTextMessageContent, InlineQuery, InlineQueryResultArticle, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import CallbackQuery
+from create_bot import dp, bot  # Подставьте правильный импорт для вашего бота
+
+# Импорт функций для работы с данными о часах
+from catalogs.rings_data.sqlite_rings import get_all_rings, get_filtered_rings, get_price_range_rings, get_total_rings, get_rings_data_by_id, get_unique_brands_rings
+from keyboards.coditiion_kb import condition_keyboard
+from keyboards.gender_kb import gender_keyboard
+from keyboards.rings_kb import create_filter_keyboard_rings
+from data.users_sqlite import save_user_filter, get_user_filters, clear_user_filters
+from states.FilterStatesRings import FiltersStateRings
+from data.config import chat_id
+
+for_whom_mapping = {
+    "gender_male": "Мужские",
+    "gender_female": "Женские",
+    "gender_unisex": "Унисекс",
+}
+
+condition_mapping = {
+    "condition_new": "Новые",
+    "condition_like_new": "Как новые",
+    "condition_used": "Б/У",
+}
+
+user_filters = {
+    'filter_price': {},
+    'filter_brand': {},
+    'filter_condition': {},
+    'filter_gender': {},
+}
+    
+# Изменения в обработчике фильтров
+@dp.callback_query_handler(lambda query: query.data in ["filter_price_rings", "filter_brand_rings", "filter_condition_rings", "filter_gender_rings"], state="*")
+async def apply_filter(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    filter_name = query.data.replace("filter_", "")  # Извлекаем имя фильтра из данных кнопки
+
+    # Завершаем общее состояние выбора фильтра
+    await FiltersStateRings.filter_selected_rings.set()
+
+    # Здесь мы сохраняем выбранный фильтр в состоянии (FSM)
+    async with state.proxy() as data:
+        data['filter'] = filter_name
+    print(data)
+    # Здесь вы можете добавить логику запроса необходимых данных у пользователя
+    if filter_name == "price_rings":
+        min_price, max_price = await get_price_range_rings()  # Получаем минимальную и максимальную цену из БД
+        await query.message.answer(f"Введите диапазон цен в долларах (минимальная: {min_price}$ и максимальная: {max_price}$, например, 3000-15000):")
+        await FiltersStateRings.filter_price_rings.set()  # Устанавливаем состояние для ожидания ценового диапазона
+        
+    if filter_name == "brand_rings":
+        # Получаем уникальные бренды из базы данных
+        unique_brands = await get_unique_brands_rings()
+        
+        # Создаем кнопки для каждого бренда
+        brand_buttons = [InlineKeyboardButton(text=brand, callback_data=f"select_brand_{brand}") for brand in unique_brands]
+        
+        rows = [brand_buttons[i:i + 2] for i in range(0, len(brand_buttons), 2)]
+        
+        # Добавляем кнопки в клавиатуру
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+
+        await query.message.answer("Выберите бренд:", reply_markup=keyboard)
+        await FiltersStateRings.filter_brand_rings.set()
+
+                
+    elif filter_name == "condition_rings":
+        await query.message.answer("Выберите состояние:", reply_markup=condition_keyboard)
+        await FiltersStateRings.filter_condition_rings.set()  # Устанавливаем состояние для ожидания состояния
+    elif filter_name == "gender_rings":
+        await query.message.answer("Выберите пол:", reply_markup=gender_keyboard)
+        await FiltersStateRings.filter_gender_rings.set()  # Устанавливаем состояние для ожидания пола
+
+@dp.message_handler(state=FiltersStateRings.filter_price_rings)
+async def process_price_range(message: Message, state: FSMContext):
+    async with state.proxy() as data:
+        try:
+            min_price, max_price = map(int, message.text.split('-'))
+            data['min_price'] = min_price
+            data['max_price'] = max_price
+        except ValueError:
+            await message.reply("Некорректный формат ввода. Пожалуйста, введите диапазон цен в формате Мин-Макс, например, 100-500.")
+            return
+
+        price_filters = {
+            'min_price': data['min_price'],
+            'max_price': data['max_price']
+        }
+
+        user_id = message.from_user.id
+
+        # Сохранение фильтров пользователя в базу данных
+        await save_user_filter(user_id, 'filter_price', price_filters)
+
+        keyboard = create_filter_keyboard_rings(await get_user_filters(user_id))
+        await message.answer("Выберите другой фильтр или нажмите поиск:", reply_markup=keyboard)
+
+        await state.finish()
+
+# Шаг 6: Обработчик для фильтра "Бренд"
+@dp.callback_query_handler(state=FiltersStateRings.filter_brand_rings)
+async def process_brand(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer()
+
+    async with state.proxy() as data:
+        brand = callback_query.data.split("_", 2)[2]
+        data['brand'] = brand
+
+        user_id = callback_query.from_user.id
+
+        # Сохранение фильтров пользователя в базу данных
+        await save_user_filter(user_id, 'filter_brand', brand)
+
+        # Создаем и обновляем клавиатуру с учетом выбранного бренда
+        keyboard = create_filter_keyboard_rings(await get_user_filters(user_id))
+        await callback_query.message.edit_text("Выберите другой фильтр или нажмите поиск:", reply_markup=keyboard)
+
+        await state.finish()  # Завершаем состояние выбора бренда
+
+# Шаг 6: Обработчик для фильтра "Состояние"
+@dp.callback_query_handler(state=FiltersStateRings.filter_condition_rings)
+async def process_condition(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer()
+
+    async with state.proxy() as data:
+        data['condition'] = callback_query.data
+
+        user_id = callback_query.from_user.id
+
+        # Сохранение фильтров пользователя в базу данных
+        await save_user_filter(user_id, 'filter_condition', data['condition'])
+
+        # Создаем и обновляем клавиатуру с учетом выбранного состояния
+        keyboard = create_filter_keyboard_rings(await get_user_filters(user_id))
+        await callback_query.message.edit_text("Выберите другой фильтр или нажмите поиск:", reply_markup=keyboard)
+
+        await state.finish()  # Завершаем состояние выбора состояния
+
+# Шаг 7: Обработчик для фильтра "Пол"
+@dp.callback_query_handler(state=FiltersStateRings.filter_gender_rings)
+async def process_gender(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer()
+
+    async with state.proxy() as data:
+        data['gender'] = callback_query.data
+
+        user_id = callback_query.from_user.id
+
+        # Сохранение фильтров пользователя в базу данных
+        await save_user_filter(user_id, 'filter_gender', data['gender'])
+
+        # Создаем и обновляем клавиатуру с учетом выбранного пола
+        keyboard = create_filter_keyboard_rings(await get_user_filters(user_id))
+        await callback_query.message.edit_text("Выберите другой фильтр или нажмите поиск:", reply_markup=keyboard)
+
+        await state.finish()  # Завершаем состояние выбора пола
+    
+# Обработчик сброса фильтров
+@dp.callback_query_handler(lambda callback_query: callback_query.data == 'reset_filters_rings')
+async def reset_filters(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    # Выполните сброс фильтров и очистите user_filters
+    for key in user_filters:
+        user_filters[key] = {}
+
+    # Удалите данные о пользователе из базы данных
+    await clear_user_filters(user_id)
+
+    # Отправьте сообщение, уведомляющее пользователя о сбросе
+    await bot.send_message(user_id, "Фильтры сброшены. Выберите другие новые фильтры для поиска колец или нажмите поиск.", reply_markup=create_filter_keyboard_rings(user_filters))
+
+
+# Обработчик для инлайн-поиска
+@dp.inline_handler(lambda query: query.query == "rings")
+async def search_inline_rings(query: InlineQuery, state: FSMContext):
+    user_id = query.from_user.id  # Получаем ID пользователя из запроса
+    filters = await get_user_filters(user_id)
+
+    print(filters)
+    offset = int(query.offset) if query.offset else 0
+    limit = 49  # Лимит на количество часов в одной порции
+    next_offset = offset + limit  # Следующая позиция начала
+
+    # Проверяем, есть ли выбранные фильтры, и выбираем соответствующую функцию для поиска
+    if not filters:
+        # Если фильтры не выбраны, используем get_all_rings без ограничения
+        filtered_rings = await get_all_rings(limit=limit, offset=offset)
+    else:
+        # Иначе используем get_filtered_rings с выбранными фильтрами
+        filtered_rings = await get_filtered_rings(filters, limit=limit, offset=offset)
+
+    results = []
+    for rings in filtered_rings:
+        rings_dict = {
+            'id': rings[0],
+            'manufacture': rings[1],
+            'name': rings[2],
+            'price': rings[3],
+            'for_whom': for_whom_mapping.get(rings[4], rings[4]),
+            'conditions': condition_mapping.get(rings[5], rings[5]),
+            'images': rings[6],  # Поле images является шестым полем (индекс 6)
+            'characteristics': rings[7]
+        }
+
+        # Проверяем, есть ли у часов название
+        if not rings_dict['name']:
+            continue  # Пропускаем результаты без названия
+
+        # Получаем первое изображение из списка изображений
+        images_list = rings_dict['images'].split(',')  # Если изображения разделены запятыми
+        first_image = images_list[0].strip() if images_list else ''  # Получаем первое изображение
+
+        # Создаем результаты инлайн-поиска для каждого товара
+        title = rings_dict['name']
+        description = f"Цена: {rings_dict['price']}, Бренд: {rings_dict['manufacture']}, Состояние: {rings_dict['conditions']}, Для кого: {rings_dict['for_whom']}"
+        input_message_content = InputTextMessageContent(f"Нажмите подробнее, чтобы увидеть все изображения и всю информацию о данном товаре")
+        thumb_url = first_image  # URL первого изображения товара
+
+        results.append(
+            InlineQueryResultArticle(
+                id=str(rings_dict['id']),
+                title=title,
+                description=description,
+                input_message_content=input_message_content,
+                thumb_url=thumb_url,
+                reply_markup=await create_rings_inline_keyboard(rings_dict['id'])  # Добавляем кнопку "Подробнее"
+            )
+        )
+
+    if next_offset < await get_total_rings():  # Если есть еще часы для отображения
+        results.append(
+            InlineQueryResultArticle(
+                id='load_more',
+                title='Загрузка...',
+                input_message_content=InputTextMessageContent("Нажмите поиск снова"),
+                thumb_url='https://png.pngtree.com/png-vector/20190817/ourlarge/pngtree-image-icon---vector-loading-download-and-upload-png-image_1694005.jpg'  # Замените на URL изображения кнопки
+            )
+        )
+
+    await query.answer(
+        results,
+        cache_time=1,
+        is_personal=True,
+        next_offset=str(next_offset)  # Устанавливаем следующий offset
+    )
+
+async def create_rings_inline_keyboard(rings_id):
+    keyboard = InlineKeyboardMarkup()
+    button = InlineKeyboardButton("Подробнее", callback_data=f"rings_{rings_id}")
+    keyboard.add(button)
+    return keyboard
+
+# Обработчик нажатия на часы
+@dp.callback_query_handler(lambda callback_query: callback_query.data.startswith('rings_'))
+async def rings_callback(query: CallbackQuery, state: FSMContext):
+    # Извлекаем идентификатор часов из callback_data
+    rings_id = int(query.data.split('_')[1])
+
+    # Получаем данные о часах по идентификатору (замените на ваш метод для получения данных о часах)
+    rings_data = await get_rings_data_by_id(rings_id)
+
+    # Проверяем, что данные о часах найдены
+    if rings_data:
+        # Разделяем данные о часах на отдельные элементы
+        rings_name = rings_data[2]  # Извлекаем имя часов из кортежа
+        rings_manufacture = rings_data[1]  # Извлекаем производителя из кортежа
+        rings_price = rings_data[3]  # Извлекаем цену из кортежа
+        rings_for_whom_text = rings_data[4]  # Извлекаем для кого из кортежа
+        rings_for_whom = for_whom_mapping.get(rings_for_whom_text, rings_for_whom_text)
+        rings_conditions_text = rings_data[5]# Извлекаем состояние из кортежа
+        rings_conditions = condition_mapping.get(rings_conditions_text, rings_conditions_text)
+        rings_images = rings_data[6].split(',')  # Если изображения разделены запятыми
+        rings_characteristics = rings_data[7]  # Извлекаем характеристики из кортежа
+        
+        async with state.proxy() as data:
+                    data['rings_name'] = rings_name
+                    data['rings_manufacture'] = rings_manufacture
+                    data['rings_price'] = rings_price
+                    data['rings_for_whom'] = rings_for_whom
+                    data['rings_conditions'] = rings_conditions
+                    data['rings_images'] = rings_images
+                    data['rings_characteristics'] = rings_characteristics
+                    
+        # Отправляем данные о часах пользователю
+        message_text = f"Название: {rings_name}\nПроизводитель: {rings_manufacture}\nЦена: {rings_price}\nДля кого: {rings_for_whom}\nСостояние: {rings_conditions}\n{rings_characteristics}"
+        await bot.send_message(chat_id=query.from_user.id, text=message_text)
+        
+        # Создаем обычную клавиатуру с двумя кнопками: "Назад" и "Я заинтересован данными часами"
+        keyboard = ReplyKeyboardMarkup(resize_keyboard=True,  selective=True, one_time_keyboard=True)
+        keyboard.add(KeyboardButton("Назад к поиску колец"))
+        keyboard.add(KeyboardButton("Я заинтересован данным кольцом"))
+        
+        # Отправляем изображения часов пользователю
+        for image_url in rings_images:
+            await bot.send_photo(chat_id=query.from_user.id, photo=image_url, reply_markup=keyboard)
+
+    # Отмечаем callback_query как обработанный, чтобы избежать дополнительных нажатий
+    await query.answer()
+
+# Функция для обработки нажатия на кнопку "Я заинтересован данным товаром"
+@dp.message_handler(lambda message: message.text == "Я заинтересован данным кольцом")
+async def interested_in_product(message: types.Message, state: FSMContext):
+    # Получаем данные о товаре из состояния FSM
+    async with state.proxy() as data:
+        rings_name = data.get('rings_name', 'N/A')
+        rings_manufacture = data.get('rings_manufacture', 'N/A')
+        rings_price = data.get('rings_price', 'N/A')
+        rings_for_whom = data.get('rings_for_whom', 'N/A')
+        rings_conditions = data.get('rings_conditions', 'N/A')
+        rings_images = data.get('rings_images', [])
+        rings_characteristics = data.get('rings_characteristics', 'N/A')
+    
+    # Получаем никнейм пользователя
+    user_nickname = message.from_user.username or "Нет никнейма"
+
+    # Формируем сообщение с данными о товаре и никнеймом пользователя
+    message_text = f"Пользователь @{user_nickname} заинтересован в товаре:\n\n"
+    message_text += f"Название: {rings_name}\nПроизводитель: {rings_manufacture}\nЦена: {rings_price}\n"
+    message_text += f"Для кого: {rings_for_whom}\nСостояние: {rings_conditions}\n"
+    message_text += f"{rings_characteristics}"
+
+    # Отправляем только первое изображение в чат с определенным идентификатором (-612247085)
+    if rings_images:
+        await bot.send_photo(chat_id=chat_id, photo=rings_images[0], caption=message_text)
+
+    # Отвечаем пользователю, что его интерес к товару передан
+    await message.answer("Ваш интерес к товару передан. Мы свяжемся с вами для уточнения деталей.\n\nНажмите /menu, чтобы вернуться в главное меню.")
